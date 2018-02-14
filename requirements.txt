@@ -1,0 +1,5 @@
+aiohttp
+aioredis
+tornado
+bs4
+flake8
