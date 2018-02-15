@@ -33,7 +33,7 @@ test: run
 # check if app is running, otherwise start in background mode
 .PHONY: run
 run: venv redis
-	@echo 'start tornado server in background mode'
+	@echo 'start web server in background mode'
 	curl -f http://localhost:$(LISTEN_PORT)/api/ping/ > /dev/null 2>&1 || (source venv/bin/activate; LISTEN_PORT=$(LISTEN_PORT) REDIS_PORT=$(REDIS_PORT) PYTHONPATH=$(PYTHON_PATH):. python3 wikiracer/app.py & >$(LOG_FILE) 2>&1)
 
 .PHONY: redis

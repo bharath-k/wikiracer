@@ -10,7 +10,6 @@ loop = asyncio.get_event_loop()
 def signal_handler(signame):
     print("Got signal {}, terminating...".format(signame))
     loop.stop()
-    # loop.close()
 
 
 def init():

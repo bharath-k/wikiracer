@@ -5,6 +5,8 @@ import aioredis
 import json
 from .settings import REDIS_HOST, REDIS_PORT
 
+redis_instance = None
+
 async def get_redis():
     '''
     Get the global redis instance.
