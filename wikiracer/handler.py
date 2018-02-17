@@ -3,6 +3,7 @@ Main handler for wikiracer
 '''
 import asyncio
 import re
+import functools
 
 from aiohttp import ClientSession
 from aiohttp.client_exceptions import ServerDisconnectedError
@@ -12,9 +13,9 @@ from .redis_utils import redis_get, redis_set
 from .settings import WIKI_PREFIX, WIKI_IGNORE_EXP
 
 # Semaphore that limits number of calls to wikipedia
-sem_fetch_url = asyncio.Semaphore(750)
+sem_fetch_url = asyncio.Semaphore(500)
 # Semaphore to limit number of sub tasks in do_work
-sem_do_work = asyncio.Semaphore(500)
+sem_do_work = asyncio.Semaphore(300)
 # NOTE: Setting to higher value for above variables leads slowing down of do_work due to high
 # number of pagefaults and async operations overhead.
 
@@ -35,17 +36,35 @@ async def url_exists(url):
         async with session.get(url) as response:
             return response.status == 200
 
+async def acquire_sem(sem):
+    '''
+    Acquire semaphore
+    '''
+    await sem.acquire()
+
+
+async def wait_for_event(event):
+    '''
+    Wait for event
+    '''
+    await event.wait()
+
 
 async def url_contents(url, lock):
     '''
     Get contents from url
     '''
-    url = construct_url(url)
-    response_text = None
     # for rate limiting.
-    async with sem_fetch_url:
+    wait_futures = [asyncio.ensure_future(acquire_sem(sem_fetch_url)),
+                    asyncio.ensure_future(wait_for_event(lock))]
+    _,pending = await asyncio.wait(wait_futures, return_when=asyncio.FIRST_COMPLETED)
+    for task in pending:
+        task.cancel()
+    response_text = None
+    try:
         if lock.is_set():
             return
+        url = construct_url(url)
         async with ClientSession() as session:
             try:
                 async with session.get(url) as response:
@@ -57,6 +76,8 @@ async def url_contents(url, lock):
                 print('Server disconnected for url:%s', url)
                 # site is refusing connections. No use trying further??
                 lock.set()
+    finally:
+        sem_fetch_url.release()
     return response_text
 
 
@@ -129,6 +150,14 @@ async def get_sorted_links(url, dest_link, dest_links, lock, traversed):
             links = intersection_links + remaining_links
     return links
 
+def cancel_sub_tasks(tasks, fut):
+    '''
+    Cancel subtasks.
+    '''
+    for task in tasks:
+        if not task.done():
+            print('cancelling subtask')
+            task.cancel()
 
 async def find_relationship(src_link, dest_link, dest_links, sem_parent, lock_parent, lock, traversed):
     '''
@@ -140,66 +169,85 @@ async def find_relationship(src_link, dest_link, dest_links, sem_parent, lock_pa
     # concurrently. Creating too many tasks leads to unnecessary page faults and slows down
     # the entire process.
     # If another branch of tree has found the link, return immediately.
-    await sem_do_work.acquire()
+
+    wait_futures = [asyncio.ensure_future(acquire_sem(sem_do_work)),
+                    asyncio.ensure_future(wait_for_event(lock))]
+    _,wait_pending = await asyncio.wait(wait_futures, return_when=asyncio.FIRST_COMPLETED)
+    for task in wait_pending:
+        task.cancel()
     if lock.is_set():
         return
-    async with sem_parent:
-        src_links = await get_sorted_links(src_link, dest_link, dest_links, lock, traversed)
-        # When the semaphore value becomes 0, set lock so that child tasks can start.
-        if sem_parent._value == 0:
-            lock_parent.set()
-    # if dest_link is one of the links, stop execution and return results.
-    # sometimes, two sublinks can link to the original source
-    if src_links and dest_link in src_links:
-        print('Success. Found %s through %s' % (dest_link, src_link))
-        # set the lock to prevent unnecessary executions in other async tasks.
-        lock.set()
-        return [src_link, dest_link]
-    elif src_links and not lock.is_set():
-        # wait until the lock_parent is set i.e. all parent nodes have been evaluated.
-        # If this lock isn't set, the program spends most of its time traversing
-        # wikipedia instead of doing any real work...
-        await lock_parent.wait()
-        sem_do_work.release()
-        # Remove all traversed nodes from src_links to avoid further processing
-        src_links = [item for item in src_links if item not in traversed]
-        # build dest_link once.
-        if not dest_links:
-            # The dest_link links are most likely to have a link to the actual dest_link, so
-            # these are prioritised during our search.
-            dest_links = await get_links(dest_link, lock)
-            if len(dest_links) == 0:
-                print('Destination is an orphan page:%s' % dest_link)
+    try:
+        async with sem_parent:
+            src_links = await get_sorted_links(src_link, dest_link, dest_links, lock, traversed)
+            # When the semaphore value becomes 0, set lock so that child tasks can start.
+            if sem_parent._value == 0:
+                lock_parent.set()
+        # if dest_link is one of the links, stop execution and return results.
+        # sometimes, two sublinks can link to the original source
+        if src_links and dest_link in src_links:
+            print('Success. Found %s through %s' % (dest_link, src_link))
+            # set the lock to prevent unnecessary executions in other async tasks.
+            lock.set()
+            return [src_link, dest_link]
+        elif src_links and not lock.is_set():
+            sem_do_work.release()
+            # wait until the lock_parent is set i.e. all parent nodes have been evaluated.
+            # If this lock isn't set, the program spends most of its time traversing
+            # wikipedia instead of doing any real work...
+            wait_futures = [asyncio.ensure_future(wait_for_event(lock_parent)),
+                            asyncio.ensure_future(wait_for_event(lock))]
+            _,wait_pending = await asyncio.wait(wait_futures, return_when=asyncio.FIRST_COMPLETED)
+            for task in wait_pending:
+                task.cancel()
+            if lock.is_set():
                 return
-        # create semaphore with initial value as len of dest_links. This ensures that all
-        # children are evaluated before grand-children are spawned.
-        sem_children = asyncio.Semaphore(len(dest_links))
-        lock_children = asyncio.Event()
-        # Create find_relationship futures for each of the links obtained.
-        # Remember that the tasks start as soon as the future is created.
-        future_tasks = [asyncio.ensure_future(find_relationship(item,
-                                                                dest_link,
-                                                                dest_links,
-                                                                sem_children,
-                                                                lock_children,
-                                                                lock,
-                                                                traversed))
-                        for item in src_links]
-        # TODO: try-except block for timeout?
-        done, pending = await asyncio.wait(future_tasks, return_when=asyncio.FIRST_COMPLETED)
-        # cancel all the pending tasks as they are no longer required.
-        for task in pending:
-            task.cancel()
-        # get output from done task, prepend current source and return
-        # NOTE: Possible that certain tasks are done but with no output due to return after lock check.
-        for task in done:
-            output = task.result()
-            # return data only for task in the success path.
-            if output:
-                print('Success. Return %s' % ([src_link] + output))
-                return [src_link] + output
-    # arrgh... no source links because node has already been evaluated. Wait for lock.
-    await lock.wait()
+            # Remove all traversed nodes from src_links to avoid further processing
+            src_links = [item for item in src_links if item not in traversed]
+            # build dest_link once.
+            if not dest_links:
+                # The dest_link links are most likely to have a link to the actual dest_link, so
+                # these are prioritised during our search.
+                dest_links = await get_links(dest_link, lock)
+                if len(dest_links) == 0:
+                    print('Destination is an orphan page:%s' % dest_link)
+                    return
+            # create semaphore with initial value as len of dest_links. This ensures that all
+            # children are evaluated before grand-children are spawned.
+            sem_children = asyncio.Semaphore(len(dest_links))
+            lock_children = asyncio.Event()
+            # Create find_relationship futures for each of the links obtained.
+            # Remember that the tasks start as soon as the future is created.
+            future_tasks = [asyncio.ensure_future(find_relationship(item,
+                                                                    dest_link,
+                                                                    dest_links,
+                                                                    sem_children,
+                                                                    lock_children,
+                                                                    lock,
+                                                                    traversed))
+                            for item in src_links]
+            # It is important that all sub tasks are cancelled correctly.
+            curr_task = asyncio.Task.current_task()
+            curr_task.add_done_callback(functools.partial(cancel_sub_tasks, future_tasks))
+            # TODO: try-except block for timeout?
+            done, pending = await asyncio.wait(future_tasks, return_when=asyncio.FIRST_COMPLETED)
+            # done, pending = await asyncio.wait(future_tasks)
+            # cancel all the pending tasks as they are no longer required.
+            # cancels are cascading due to our callback.
+            for task in pending:
+                task.cancel()
+            # get output from done task, prepend current source and return
+            # NOTE: Possible that certain tasks are done but with no output due to return after lock check.
+            for task in done:
+                output = task.result()
+                # return data only for task in the success path.
+                if output:
+                    print('Success. Return %s' % ([src_link] + output))
+                    return [src_link] + output
+        # arrgh... no source links because node has already been evaluated. Wait for lock.
+        await lock.wait()
+    finally:
+       sem_do_work.release()
     # NOTE: If task rate-limiting is desired, check if it's easier to cancel the current task instead of
     # waiting on lock
 
@@ -222,5 +270,6 @@ async def do_work(src_link, dest_link):
     # At the top level, value of semaphore can be one.
     sem_parent = asyncio.Semaphore(1)
     lock_parent = asyncio.Event()
+    print('calling do_work')
     links = await find_relationship(src_link, dest_link, None, sem_parent, lock_parent, lock, traversed)
     return links

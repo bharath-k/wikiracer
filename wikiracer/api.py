@@ -20,6 +20,7 @@ async def links_handler(request):
     '''
     Handle links request.
     '''
+    logger.info("Handling new request")
     # parse input
     try:
         data= await request.json()
@@ -31,16 +32,14 @@ async def links_handler(request):
         await validate_input(data)
     except ValidationError as e:
         logger.warning("Validation error: {}".format(e))
-        raise
-        # raise web.HTTPBadRequest(text=str(e))
+        raise web.HTTPBadRequest(text=str(e))
+    logger.warning("new request validated")
     source = data['source']
     destination = data['destination']
     try:
         result = await do_work(source, destination)
     except Exception as e:
-        logger.warning("Validation error: {}".format(e))
-        raise
-        # raise web.HTTPNotFound(text=str(e))
-    else:
-        return web.json_response(result)
+        logger.warning("do_work error: {}".format(e))
+        raise web.HTTPNotFound(text=str(e))
+    return web.json_response(result)
 
