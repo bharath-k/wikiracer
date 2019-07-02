@@ -24,7 +24,7 @@ if __name__ == '__main__':
     app.router.add_get('/api/ping', ping_handler)
     app.router.add_post('/api/links', links_handler)
     try:
-        web.run_app(app,host='localhost',port=LISTEN_PORT)
+        web.run_app(app,host='0.0.0.0',port=LISTEN_PORT)
     finally:
         loop.close()
         stop()

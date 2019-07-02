@@ -1,0 +1,12 @@
+version: "3.7"
+services:
+    wikiracer_app:
+        build: .
+        ports:
+        - "8080:8080"
+        volumes:
+        - .:/wikiracer
+        links:
+        - redis
+    redis:
+        image: redis:latest

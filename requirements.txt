@@ -1,4 +1,3 @@
 aiohttp
 aioredis
 bs4
-flake8
